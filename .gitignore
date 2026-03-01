@@ -13,3 +13,13 @@ dist/
 # Databases
 *.db
 *.sqlite3
+
+# Logs
+*.log
+
+# Uploads
+backend/uploads/
+
+# IDE
+.vscode/
+.idea/

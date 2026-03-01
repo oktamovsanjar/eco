@@ -47,7 +47,7 @@ async def register(user_data: UserRegister, db: AsyncSession = Depends(get_db)):
     await db.refresh(new_user)
 
     # Token yaratish
-    access_token = create_access_token(data={"sub": new_user.id})
+    access_token = create_access_token(data={"sub": str(new_user.id)})
 
     return Token(
         access_token=access_token,
@@ -84,7 +84,7 @@ async def login(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
     await db.refresh(user)
 
     # Token yaratish
-    access_token = create_access_token(data={"sub": user.id})
+    access_token = create_access_token(data={"sub": str(user.id)})
 
     return Token(
         access_token=access_token,
@@ -155,6 +155,80 @@ async def update_user_role(
     if role_data.organization_type:
         user.organization_type = role_data.organization_type
 
+    await db.commit()
+    await db.refresh(user)
+    return UserResponse.model_validate(user)
+
+
+@router.post("/create-moderator", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def create_moderator(
+    user_data: UserRegister,
+    role: UserRole = UserRole.MODERATOR,
+    organization_name: str = "",
+    organization_type: str = "",
+    admin: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Admin: Yangi moderator/tashkilot yaratish."""
+    # Email yoki username mavjudligini tekshirish
+    existing = await db.execute(
+        select(User).where(
+            or_(User.email == user_data.email, User.username == user_data.username)
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bu email yoki username allaqachon ro'yxatdan o'tgan"
+        )
+
+    new_user = User(
+        email=user_data.email,
+        username=user_data.username,
+        full_name=user_data.full_name,
+        hashed_password=hash_password(user_data.password),
+        phone=user_data.phone,
+        role=role,
+        organization_name=organization_name or None,
+        organization_type=organization_type or None,
+        is_active=True,
+        is_verified=True
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+    return UserResponse.model_validate(new_user)
+
+
+@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user(
+    user_id: int,
+    admin: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Admin: Foydalanuvchini o'chirish."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+    if user.role == UserRole.ADMIN:
+        raise HTTPException(status_code=400, detail="Admin foydalanuvchini o'chirib bo'lmaydi")
+    await db.delete(user)
+    await db.commit()
+
+
+@router.put("/users/{user_id}/toggle-active", response_model=UserResponse)
+async def toggle_user_active(
+    user_id: int,
+    admin: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Admin: Foydalanuvchini bloklash/faollashtirish."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+    user.is_active = not user.is_active
     await db.commit()
     await db.refresh(user)
     return UserResponse.model_validate(user)

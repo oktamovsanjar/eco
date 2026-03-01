@@ -150,6 +150,8 @@ class ReportListResponse(BaseModel):
     latitude: float
     longitude: float
     address: Optional[str] = None
+    region: Optional[str] = None
+    district: Optional[str] = None
     status: ReportStatus
     author_name: Optional[str] = None
     upvotes: int

@@ -28,17 +28,22 @@ router = APIRouter(prefix="/api/reports", tags=["Shikoyatlar"])
 def _build_report_response(report: Report) -> ReportResponse:
     """Report obyektdan response yaratish."""
     comments = []
-    for c in (report.comments or []):
-        comments.append(CommentResponse(
-            id=c.id,
-            report_id=c.report_id,
-            author_id=c.author_id,
-            author_name=c.author.full_name if c.author else None,
-            author_role=c.author.role.value if c.author else None,
-            content=c.content,
-            is_official=c.is_official,
-            created_at=c.created_at
-        ))
+    try:
+        if report.comments:
+            for c in report.comments:
+                comments.append(CommentResponse(
+                    id=c.id,
+                    report_id=c.report_id,
+                    author_id=c.author_id,
+                    author_name=c.author.full_name if c.author else None,
+                    author_role=c.author.role.value if c.author and hasattr(c.author.role, 'value') else (c.author.role if c.author else None),
+                    content=c.content,
+                    is_official=c.is_official,
+                    created_at=c.created_at
+                ))
+    except Exception:
+        # Fallback if relationships failed to load properly
+        pass
 
     return ReportResponse(
         id=report.id,
@@ -59,9 +64,9 @@ def _build_report_response(report: Report) -> ReportResponse:
         verified_at=report.verified_at,
         resolution_description=report.resolution_description,
         resolved_at=report.resolved_at,
-        points_awarded=report.points_awarded,
-        upvotes=report.upvotes,
-        views_count=report.views_count,
+        points_awarded=report.points_awarded or 0,
+        upvotes=report.upvotes or 0,
+        views_count=report.views_count or 0,
         images=[ReportImageResponse.model_validate(img) for img in (report.images or [])],
         comments=comments,
         created_at=report.created_at,
@@ -171,6 +176,21 @@ async def list_reports(
         selectinload(Report.comments)
     )
 
+    # Huquqlarni tekshirish: Admin/Moderator bo'lmasa, faqat ma'lum statusdagilarni ko'radi
+    is_privileged = current_user and current_user.role in [UserRole.ADMIN, UserRole.MODERATOR, UserRole.ORGANIZATION]
+    
+    if not is_privileged:
+        # Oddiy foydalanuvchilar faqat tasdiqlangan/faol statuslarni ko'radi
+        # Ammo o'zlarining hisobotlarini har qanday holatda ko'rishlari mumkin
+        if current_user and current_user.username != "guest":
+            query = query.where(
+                (Report.status.in_([ReportStatus.VERIFIED, ReportStatus.RESOLVED, ReportStatus.IN_PROGRESS])) |
+                (Report.author_id == current_user.id)
+            )
+        else:
+            query = query.where(Report.status.in_([ReportStatus.VERIFIED, ReportStatus.RESOLVED, ReportStatus.IN_PROGRESS]))
+    
+
     # Filtrlar
     if my_reports and current_user:
         query = query.where(Report.author_id == current_user.id)
@@ -200,6 +220,8 @@ async def list_reports(
             latitude=r.latitude,
             longitude=r.longitude,
             address=r.address,
+            region=r.region,
+            district=r.district,
             status=r.status,
             author_name=r.author.full_name if r.author else None,
             upvotes=r.upvotes,
@@ -220,10 +242,25 @@ async def get_map_markers(
     max_lat: Optional[float] = None,
     min_lng: Optional[float] = None,
     max_lng: Optional[float] = None,
+    current_user: Optional[User] = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Xarita uchun marker ma'lumotlarini olish (ochiq API)."""
     query = select(Report)
+    
+    # Huquqlar
+    is_privileged = current_user and current_user.role in [UserRole.ADMIN, UserRole.MODERATOR, UserRole.ORGANIZATION]
+    
+    if not is_privileged:
+        # Oddiy foydalanuvchi/mehmon faqat tasdiqlanganlarni ko'radi
+        if current_user and current_user.username != "guest":
+            query = query.where(
+                (Report.status.in_([ReportStatus.VERIFIED, ReportStatus.RESOLVED, ReportStatus.IN_PROGRESS])) |
+                (Report.author_id == current_user.id)
+            )
+        else:
+            query = query.where(Report.status.in_([ReportStatus.VERIFIED, ReportStatus.RESOLVED, ReportStatus.IN_PROGRESS]))
+    
 
     filters = []
     if category:
@@ -311,6 +348,21 @@ async def get_report(
     db: AsyncSession = Depends(get_db)
 ):
     """Bitta shikoyatni toliq ko'rish (ochiq API)."""
+    from sqlalchemy import update as sql_update
+
+    # 1. Ko'rishlar sonini oshirish (eng birinchi)
+    try:
+        await db.execute(
+            sql_update(Report)
+            .where(Report.id == report_id)
+            .values(views_count=Report.views_count + 1)
+        )
+        await db.commit()
+    except Exception as e:
+        print(f"Update views error: {e}")
+        await db.rollback()
+
+    # 2. To'liq ma'lumotni yuklash (commitdan keyin yangi session holatida)
     result = await db.execute(
         select(Report)
         .options(
@@ -322,14 +374,17 @@ async def get_report(
         .where(Report.id == report_id)
     )
     report = result.scalar_one_or_none()
+    
     if not report:
         raise HTTPException(status_code=404, detail="Hisobot topilmadi")
 
-    # Ko'rishlar sonini oshirish
-    report.views_count += 1
-    await db.commit()
-
-    return _build_report_response(report)
+    try:
+        return _build_report_response(report)
+    except Exception as e:
+        print(f"Build response error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Serialization error: {str(e)}")
 
 
 @router.put("/{report_id}", response_model=ReportResponse)
@@ -555,7 +610,8 @@ async def get_pending_reports(
         query = query.where(Report.category == category)
 
     # Tashkilot turi bilan filtr (moderator o'z sohasidagi hisobotlarni ko'radi)
-    if moderator.organization_type:
+    # Admin bo'lsa barchasini ko'radi
+    if moderator.role != UserRole.ADMIN and moderator.organization_type:
         type_to_category = {
             "ekologiya": [ReportCategory.ECOLOGY, ReportCategory.WATER, ReportCategory.AIR,
                          ReportCategory.DEFORESTATION, ReportCategory.WASTE],
@@ -577,6 +633,8 @@ async def get_pending_reports(
             latitude=r.latitude,
             longitude=r.longitude,
             address=r.address,
+            region=r.region,
+            district=r.district,
             status=r.status,
             author_name=r.author.full_name if r.author else None,
             upvotes=r.upvotes,

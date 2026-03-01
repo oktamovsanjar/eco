@@ -85,5 +85,15 @@ export const api = {
 
     async getLeaderboard() {
         return this.request("/auth/leaderboard");
-    }
+    },
+
+    async getReport(id) {
+        return this.request(`/reports/${id}`);
+    },
+
+    async upvoteReport(id) {
+        return this.request(`/reports/${id}/upvote`, {
+            method: "POST",
+        });
+    },
 };
